@@ -3,6 +3,8 @@ assets/
 checkpoints/
 data/
 wandb/
+mujoco-py/
+policy_records/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

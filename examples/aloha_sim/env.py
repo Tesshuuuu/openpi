@@ -13,7 +13,7 @@ class AlohaSimEnvironment(_environment.Environment):
         np.random.seed(seed)
         self._rng = np.random.default_rng(seed)
 
-        self._gym = gymnasium.make(task, obs_type=obs_type)
+        self._gym = gymnasium.make(task, obs_type=obs_type, render_mode="rgb_array")
 
         self._last_obs = None
         self._done = True

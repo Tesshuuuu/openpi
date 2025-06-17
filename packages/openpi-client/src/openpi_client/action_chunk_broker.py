@@ -4,6 +4,7 @@ import numpy as np
 import tree
 from typing_extensions import override
 
+import logging
 from openpi_client import base_policy as _base_policy
 
 
@@ -30,7 +31,12 @@ class ActionChunkBroker(_base_policy.BasePolicy):
             self._last_results = self._policy.infer(obs)
             self._cur_step = 0
 
-        results = tree.map_structure(lambda x: x[self._cur_step, ...], self._last_results)
+        def _index_if_array(x):
+            if isinstance(x, np.ndarray):
+                return x[self._cur_step, ...]
+            return x
+
+        results = tree.map_structure(_index_if_array, self._last_results)
         self._cur_step += 1
 
         if self._cur_step >= self._action_horizon:
