@@ -21,7 +21,8 @@ class AlohaSimEnvironment(_environment.Environment):
 
     @override
     def reset(self) -> None:
-        gym_obs, _ = self._gym.reset(seed=int(self._rng.integers(2**32 - 1)))
+        # gym_obs, _ = self._gym.reset(seed=int(self._rng.integers(2**32 - 1)))
+        gym_obs, _ = self._gym.reset(seed=42)
         self._last_obs = self._convert_observation(gym_obs)  # type: ignore
         self._done = False
         self._episode_reward = 0.0

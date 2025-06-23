@@ -1,6 +1,8 @@
 import logging
 import threading
 import time
+import numpy as np
+import pathlib
 
 from openpi_client.runtime import agent as _agent
 from openpi_client.runtime import environment as _environment
@@ -32,7 +34,15 @@ class Runtime:
     def run(self) -> None:
         """Runs the runtime loop continuously until stop() is called or the environment is done."""
         for _ in range(self._num_episodes):
-            self._run_episode()
+            actions = self._run_episode()
+            # save the actions to a file in the data/aloha_sim/actions
+            out_dir = pathlib.Path("data/aloha_sim/actions")
+            existing = list(out_dir.glob("actions_[0-9]*.npy"))
+            next_idx = max([int(p.stem.split("_")[1]) for p in existing], default=-1) + 1
+            out_path = out_dir / f"actions_{next_idx}.npy"
+
+            logging.info(f"Saving actions to {out_path}")
+            np.save(out_path, actions)
 
         # Final reset, this is important for real environments to move the robot to its home position.
         self._environment.reset()
@@ -47,7 +57,7 @@ class Runtime:
         """Marks the end of an episode."""
         self._in_episode = False
 
-    def _run_episode(self) -> None:
+    def _run_episode(self) -> np.ndarray:
         """Runs a single episode."""
         logging.info("Starting episode...")
         self._environment.reset()
@@ -60,8 +70,12 @@ class Runtime:
         step_time = 1 / self._max_hz if self._max_hz > 0 else 0
         last_step_time = time.time()
 
+        # save the sequence of actions
+        actions = []
+
         while self._in_episode:
-            self._step()
+            action = self._step()
+            actions.append(action)
             self._episode_steps += 1
 
             # Sleep to maintain the desired frame rate
@@ -77,10 +91,17 @@ class Runtime:
         for subscriber in self._subscribers:
             subscriber.on_episode_end()
 
-    def _step(self) -> None:
-        """A single step of the runtime loop."""
+        return actions
+
+    def _step(self) -> np.ndarray:
+        """A single step of the runtime loop.
+        
+        Returns:
+            np.ndarray: The action taken by the agent.
+        """
         observation = self._environment.get_observation()
         action = self._agent.get_action(observation)
+
         self._environment.apply_action(action)
 
         for subscriber in self._subscribers:
@@ -90,3 +111,6 @@ class Runtime:
             self._max_episode_steps > 0 and self._episode_steps >= self._max_episode_steps
         ):
             self.mark_episode_complete()
+
+        # return only the np.ndarray of action which is the first element of the action
+        return action["actions"]
