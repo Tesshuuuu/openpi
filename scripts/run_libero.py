@@ -34,7 +34,7 @@ class Args:
 
     instruction: str = ""
 
-    max_steps: int = 300
+    max_steps: int = 150
 
     num_runs: int = 1
 
@@ -257,6 +257,7 @@ def main(args: Args):
 
             # print if there's a collision
             sim = env.env.sim
+            geom_lst = set()
             if sim.data.ncon > 0:
                 for n in range(sim.data.ncon):
                     c = sim.data.contact[n]
@@ -277,12 +278,13 @@ def main(args: Args):
 
                         geom2 = geom2_body_name
 
-                    # only count collisions involvoing the gripper, exclude cheese and butter too
-                    if "gripper" in geom1 or "gripper" in geom2 and "cheese" not in geom1 and "butter" not in geom1 and "cheese" not in geom2 and "butter" not in geom2:
-                        print(f"Collision detected at step {i}")
-                        print(f"Geom1: {geom1}")
-                        print(f"Geom2: {geom2}")
-            
+                    
+                    if "table" not in geom1 and "table" not in geom2:
+                        geom_lst.add((geom1, geom2))
+
+            print(f"Collision detected at step {i}")
+            print(f"Geom pairs: {geom_lst}")
+
 
         print(f"Iteration {j}: Finished at step {i} with status {done}")
 
