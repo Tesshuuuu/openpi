@@ -6,7 +6,7 @@ from pathlib import Path
 from libero.libero import benchmark
 from libero.libero.envs import OffScreenRenderEnv
 import cv2
-
+import mujoco
 from libero.libero import get_libero_path
 import os
 import numpy as np
@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 from typing import Dict
 import torch
 import math
+import copy
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -34,7 +35,7 @@ class Args:
 
     instruction: str = ""
 
-    max_steps: int = 150
+    max_steps: int = 160
 
     num_runs: int = 1
 
@@ -58,23 +59,24 @@ def _quat2axisangle(quat):
 
 
 class FrameSaver:
-    def __init__(self, should_viz):
+    def __init__(self, should_viz, recording_enabled_getter=None):
         self.fig, self.ax = plt.subplots()
         self.im = None
-
         self.should_viz = should_viz
         self.frames = []
+        self.recording_enabled_getter = recording_enabled_getter
 
     def update(self, img: np.ndarray):
+        # Only record if recording_enabled is True (if provided)
+        if self.recording_enabled_getter is not None and not self.recording_enabled_getter():
+            return
         if self.should_viz:
             if not self.im:
                 self.im = self.ax.imshow(img)
             else:
                 self.im.set_data(img)
-
             plt.draw()
             plt.pause(0.1)
-
         self.frames.append(img)
 
     def write_video(self, filename, fps=10):
@@ -138,7 +140,8 @@ class LiberoWrapper:
         self.t = 0
 
         self.should_viz = viz
-        self.viz = FrameSaver(should_viz=viz)
+        self.recording_enabled = True
+        self.viz = FrameSaver(should_viz=viz, recording_enabled_getter=lambda: self.recording_enabled)
 
     def reset(self):
         self.env.seed(0)
@@ -227,10 +230,114 @@ def run_task(
 
     return True
 
+from typing import Set, Tuple
+
+def collision_detect(env, model, data) -> Set[Tuple[str, str]]:
+    """
+    Returns a set of (geom1_name, geom2_name) for every contact 
+    in data.contact that does *not* involve 'table'.
+    """
+    geom_pairs = set()
+    sim_orig = env.env.sim
+
+    if data.ncon > 0:
+        for n in range(data.ncon):
+            c = data.contact[n]
+            geom1 = sim_orig.model.geom_id2name(c.geom1)
+            geom2 = sim_orig.model.geom_id2name(c.geom2)    
+
+
+            # Provide additional information for unnamed geoms
+            if geom1 is None:
+                geom1_body_id = sim_orig.model.geom_bodyid[c.geom1]
+                geom1_body_name = sim_orig.model.body_id2name(geom1_body_id)
+                geom1_type = sim_orig.model.geom_type[c.geom1]
+                
+                geom1 = geom1_body_name
+            
+            if geom2 is None:
+                geom2_body_id = sim_orig.model.geom_bodyid[c.geom2]
+                geom2_body_name = sim_orig.model.body_id2name(geom2_body_id)
+                geom2_type = sim_orig.model.geom_type[c.geom2]
+
+                geom2 = geom2_body_name
+            
+            if "table" not in geom1 and "table" not in geom2:
+                geom_pairs.add((geom1, geom2))
+
+                if "milk" in geom1 or "milk" in geom2:
+                    print(f"Milk collision detected: {geom1} and {geom2}")
+
+    return geom_pairs
+
+def collision_aware_action_plan(env, nominal_plan, pi_obs, policy, replan_steps, n_samples=15, sigma=0.2):
+    """
+    Try your nominal_plan first; if it ever collides with 'milk', 
+    sample up to n_samples noisy variants and pick the one that
+    avoids milk the furthest (or is fully collision-free).
+    Uses the real environment's step and state save/restore for exact matching.
+    """
+    sim = env.env.sim
+    best_plan = copy.deepcopy(nominal_plan)
+    best_score = -1   # how many steps we got before a milk collision
+    all_traces = {}
+
+    prev_recording_enabled = env.recording_enabled
+    env.recording_enabled = False
+
+    for sample_idx in range(n_samples):
+        # build candidate
+        if sample_idx == 0:
+            candidate = copy.deepcopy(nominal_plan)
+        else:
+            # # randomize the action plan
+            # candidate = [
+            #     a + np.random.randn(*a.shape) * sigma
+            #     for a in nominal_plan
+            # ]
+
+            # sample from the policy
+            candidate_chunk = policy.infer(pi_obs)["actions"]
+            candidate = candidate_chunk[:replan_steps]
+
+        # Save the sim state before rolling out the candidate
+        saved_state = env.env.sim.get_state()
+        steps_safe = 0
+        trace = []
+        for t, action in enumerate(candidate):
+            trace.append(env.env.sim.data.qpos.copy()[:1])
+            obs, reward, done, info = env.step(action)
+            contacts = collision_detect(env, env.env.sim.model, env.env.sim.data)
+            if any("milk" in g1 or "milk" in g2 for g1,g2 in contacts) or any("orange" in g1 or "orange" in g2 for g1,g2 in contacts):
+                print(f"Simulated Contacts: {contacts}")
+                break
+            steps_safe += 1
+        trace.append(env.env.sim.data.qpos.copy()[:1])
+        all_traces[sample_idx] = trace
+        print(f"Trace {sample_idx}: {trace}")
+        # Restore the sim state after candidate rollout
+        env.env.sim.set_state(saved_state)
+        env.env.sim.forward()
+        # if it survived *all* steps, we're done
+        if steps_safe == len(candidate):
+            print(f"✅ Sample {sample_idx} was fully milk and orange juice free.")
+            env.recording_enabled = prev_recording_enabled
+            return collections.deque(candidate)
+        # otherwise keep the plan that got the furthest
+        if steps_safe > best_score:
+            best_score = steps_safe
+            best_plan  = candidate
+            print(f"⚠️ Sample {sample_idx} survived {best_score}/{len(candidate)} steps.")
+    print(f"▶️ Returning best plan (avoids milk for {best_score} steps).")
+    env.recording_enabled = prev_recording_enabled
+    return collections.deque(best_plan)
+
+
 
 def main(args: Args):
-    replan_steps = 5
+    replan_steps = 8
     policy_config = DEFAULT_CHECKPOINT[EnvMode.LIBERO]
+    print(f"Replan steps: {replan_steps}")
 
     policy = _policy_config.create_trained_policy(
         _config.get_config(policy_config.config), policy_config.dir
@@ -252,39 +359,22 @@ def main(args: Args):
 
                 action_plan.extend(action_chunk[:replan_steps])
 
+                # check if the action plan has no collision
+                print(f"--- Collision Aware Action Plan ---")
+                action_plan = collision_aware_action_plan(env, action_plan, pi_obs, policy, replan_steps)
+
             action = action_plan.popleft()
+            # action = collision_aware_action(env, action)
             obs, reward, done, info = env.step(action)
 
-            # print if there's a collision
-            sim = env.env.sim
-            geom_lst = set()
-            if sim.data.ncon > 0:
-                for n in range(sim.data.ncon):
-                    c = sim.data.contact[n]
-                    geom1 = sim.model.geom_id2name(c.geom1)
-                    geom2 = sim.model.geom_id2name(c.geom2)                    
-                    # Provide additional information for unnamed geoms
-                    if geom1 is None:
-                        geom1_body_id = sim.model.geom_bodyid[c.geom1]
-                        geom1_body_name = sim.model.body_id2name(geom1_body_id)
-                        geom1_type = sim.model.geom_type[c.geom1]
-                        
-                        geom1 = geom1_body_name
-                    
-                    if geom2 is None:
-                        geom2_body_id = sim.model.geom_bodyid[c.geom2]
-                        geom2_body_name = sim.model.body_id2name(geom2_body_id)
-                        geom2_type = sim.model.geom_type[c.geom2]
+            # print the state of the sim
+            print(f"--- Real Simulation ---")
+            print(f"Step {i}: State: {env.env.sim.data.qpos[:1]}")
 
-                        geom2 = geom2_body_name
-
-                    
-                    if "table" not in geom1 and "table" not in geom2:
-                        geom_lst.add((geom1, geom2))
-
-            print(f"Collision detected at step {i}")
-            print(f"Geom pairs: {geom_lst}")
-
+            geom_lst = collision_detect(env, env.env.sim.model, env.env.sim.data)
+            # print only the geom pairs that contain "milk" and "cheese"
+            if "milk" in geom_lst:
+                print(f"Collision detected: {geom_lst}")
 
         print(f"Iteration {j}: Finished at step {i} with status {done}")
 

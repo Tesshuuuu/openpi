@@ -150,6 +150,8 @@ class Pi0FAST(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
 
+        self.embeddings = []
+
     @at.typecheck
     def embed_inputs(
         self, obs: _model.Observation
@@ -233,7 +235,7 @@ class Pi0FAST(_model.BaseModel):
         observation: _model.Observation,
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
-        temperature: float = 0.0,
+        temperature: float = 2.3,
     ) -> _model.Actions:
         # TODO: this is a hack to get the image keys.
         observation = _model.preprocess_observation(
@@ -265,7 +267,7 @@ class Pi0FAST(_model.BaseModel):
         output_tokens = jnp.zeros((last_logit.shape[0], max_decoding_steps))
 
         def step(carry):
-            last_logit, output_tokens, cache, _, step = carry
+            last_logit, output_tokens, cache, _, step, _  = carry
 
             # Sample token from last logit
             if temperature > 0.0:
@@ -287,16 +289,22 @@ class Pi0FAST(_model.BaseModel):
                 jnp.arange(prefill_size + max_decoding_steps)[None, None, :]
                 < (jnp.broadcast_to(prefill_size + step + 1, (prefix_start.shape[0], 1, 1))),
             )
-            last_logit, kv_cache, _ = self.PaliGemma.llm(
+            last_logit, kv_cache, out_embeddings = self.PaliGemma.llm(
                 embedded_prefix=token_embedding, mask=mask, positions=positions, decode=True, kv_cache=cache
             )
 
-            return last_logit, output_tokens, kv_cache, all_eos, step + 1
+            # we have encoded, pre-logits, and logits
+            final_embedding = out_embeddings["encoded"]
+
+            return last_logit, output_tokens, kv_cache, all_eos, step + 1, final_embedding
 
         def cond(carry):
-            _, _, _, all_eos, step = carry
+            _, _, _, all_eos, step, _ = carry
             return (~all_eos) & (step < max_decoding_steps)
 
+        
+
+        embedding = jnp.ones([1, 1 , 2048], jnp.bfloat16)
         # Use lax.while_loop so we can jit the full decoding loop.
-        _, output_tokens, _, _, _ = jax.lax.while_loop(cond, step, (last_logit, output_tokens, kv_cache, False, 0))
-        return output_tokens
+        _, output_tokens, _, _, _, token_embedding = jax.lax.while_loop(cond, step, (last_logit, output_tokens, kv_cache, False, 0, embedding))
+        return output_tokens, token_embedding
